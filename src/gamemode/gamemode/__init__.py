@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import time
 from math import ceil, floor
-from typing import Optional, Any, Set
+from typing import Optional, Any, Set, Callable
+import threading
 
 from mcdreforged.api.types import PluginServerInterface, PlayerCommandSource
 from mcdreforged.api.command import *
@@ -21,6 +22,34 @@ DIMENSIONS = {
     'minecraft:the_nether': 'minecraft:the_nether',
     'minecraft:the_end': 'minecraft:the_end'
 }
+
+class LoopManager:
+    def __init__(self, run_function: Callable, interval: int):
+        self.run_function = run_function
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self.thread = None
+
+    def start(self):
+        def loop():
+            while not self._stop_event.wait(self.interval):
+                self.run_function()
+
+        # If a thread is already running, stop it before starting a new one
+        if self.thread is not None and self.thread.is_alive():
+            self.stop()
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        if self.thread is not None:
+            self._stop_event.set()
+            self.thread.join()
+            self.thread = None
+            self._stop_event.clear()
+
+
+loop_manager: Optional[LoopManager] = None
 
 HUMDIMS = {
     'minecraft:overworld': '主世界',
@@ -74,7 +103,7 @@ monitor_players: Set[str] = set()
 
 
 def on_load(server: PluginServerInterface, old):
-    global config, data, minecraft_data_api
+    global config, data, minecraft_data_api, loop_manager
     config = server.load_config_simple(
         'config.json',
         default_config=DEFAULT_CONFIG,
@@ -89,46 +118,43 @@ def on_load(server: PluginServerInterface, old):
 
     server.register_help_message('!!spec help', 'Gamemode 插件帮助')
 
-    @new_thread("check_player_pos")
     def check_player_pos():
-        while True:
-            time.sleep(config.range_limit.check_interval)
-            # copy 用于防止竞争冒险
-            for player in monitor_players.copy():
-                center = data.get(player, {}).get("pos", None)
-                if center is None:
+        # copy 用于防止竞争冒险
+        for player in monitor_players.copy():
+            center = data.get(player, {}).get("pos", None)
+            if center is None:
+                continue
+            center = [round(float(x)) for x in center]
+            pos = minecraft_data_api.get_player_info(player, "Pos")
+            pos = [float(x) for x in pos]
+
+            radius = [
+                config.range_limit.x,
+                config.range_limit.y,
+                config.range_limit.z,
+            ]
+
+            valid_ranges = [
+                (center[i] - radius[i], center[i] + radius[i])
+                if radius[i] > 0
+                else None
+                for i in range(3)
+            ]
+
+            need_teleport = False
+            for i in range(3):
+                if valid_ranges[i] is None:
                     continue
-                center = [round(float(x)) for x in center]
-                pos = minecraft_data_api.get_player_info(player, "Pos")
-                pos = [float(x) for x in pos]
+                if pos[i] < valid_ranges[i][0]:
+                    need_teleport = True
+                    pos[i] = valid_ranges[i][0] + 0.5
+                elif pos[i] > valid_ranges[i][1]:
+                    need_teleport = True
+                    pos[i] = valid_ranges[i][1] - 0.5
 
-                radius = [
-                    config.range_limit.x,
-                    config.range_limit.y,
-                    config.range_limit.z,
-                ]
-
-                valid_ranges = [
-                    (center[i] - radius[i], center[i] + radius[i])
-                    if radius[i] > 0
-                    else None
-                    for i in range(3)
-                ]
-
-                need_teleport = False
-                for i in range(3):
-                    if valid_ranges[i] is None:
-                        continue
-                    if pos[i] < valid_ranges[i][0]:
-                        need_teleport = True
-                        pos[i] = valid_ranges[i][0] + 0.5
-                    elif pos[i] > valid_ranges[i][1]:
-                        need_teleport = True
-                        pos[i] = valid_ranges[i][1] - 0.5
-
-                if need_teleport:
-                    server.execute(f"tp {player} {pos[0]} {pos[1]} {pos[2]}")
-                    server.tell(player, "§c您已超出活动范围，已被自动传送回活动范围内")
+            if need_teleport:
+                server.execute(f"tp {player} {pos[0]} {pos[1]} {pos[2]}")
+                server.tell(player, "§c您已超出活动范围，已被自动传送回活动范围内")
 
     @new_thread('Gamemode switch mode')
     def change_mode(src, ctx):
@@ -293,7 +319,8 @@ def on_load(server: PluginServerInterface, old):
     if config.range_limit.check_interval > 0 and (
         config.range_limit.x > 0 or config.range_limit.y > 0 or config.range_limit.z > 0
     ):
-        check_player_pos()
+        loop_manager = LoopManager(check_player_pos, config.range_limit.check_interval)
+        loop_manager.start()
 
     # spec literals
     spec_literals = ['!!spec']
@@ -378,3 +405,10 @@ def spec_to_sur(server, player):
 def on_player_joined(server, player, info):
     if player in data.keys():
         server.execute(f'gamemode spectator {player}')
+
+
+def on_unload(server: PluginServerInterface):
+    global loop_manager
+    if loop_manager is not None:
+        loop_manager.stop()
+        loop_manager = None

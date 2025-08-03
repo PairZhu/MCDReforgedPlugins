@@ -125,7 +125,13 @@ def on_load(server: PluginServerInterface, old):
             if center is None:
                 continue
             center = [round(float(x)) for x in center]
-            pos = minecraft_data_api.get_player_info(player, "Pos")
+            try:
+                pos = minecraft_data_api.get_player_info(player, "Pos")
+            except Exception as e:
+                server.logger.warning(
+                    player, f"§c无法获取玩家 {player} 的位置: {str(e)}"
+                )
+                continue
             pos = [float(x) for x in pos]
 
             radius = [
@@ -402,9 +408,16 @@ def spec_to_sur(server, player):
     save_data(server)
 
 
-def on_player_joined(server, player, info):
+def on_player_joined(server: PluginServerInterface, player, info):
     if player in data.keys():
         server.execute(f'gamemode spectator {player}')
+        if server.get_permission_level(player) < config.tp:
+            monitor_players.add(player)
+
+
+def on_player_left(server: PluginServerInterface, player):
+    if player in data.keys():
+        monitor_players.discard(player)
 
 
 def on_unload(server: PluginServerInterface):
